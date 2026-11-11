@@ -1,0 +1,235 @@
+name: Build Play (Frame Skip)
+
+# Run it manually: Actions tab -> "Build Play (Frame Skip)" -> Run workflow
+on: workflow_dispatch
+
+env:
+  ANDROID_BUILD_TOOLS_VERSION: '34.0.0'
+  ANDROID_NDK_VERSION: '25.2.9519653'
+  ANDROID_CMAKE_VERSION: '3.31.1'
+
+jobs:
+  build_android:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Set up JDK
+      uses: actions/setup-java@v6
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+    - name: Install NDK
+      run: $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;${{ env.ANDROID_NDK_VERSION }}"
+    - name: Install CMake
+      run: $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "cmake;${{ env.ANDROID_CMAKE_VERSION }}"
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        submodules: recursive
+        fetch-depth: 0
+    - name: Fetch Git Tags
+      run: |
+        git fetch --tags --force || true
+        git fetch --tags --force https://github.com/jpd002/Play-.git || true
+    - name: Apply frame skip patch
+      run: |
+        cat > frameskip.patch <<'PATCH_EOF'
+        --- a/Source/gs/GSHandler.h
+        +++ b/Source/gs/GSHandler.h
+        @@ -22,6 +22,7 @@
+         #define PREF_CGSHANDLER_PRESENTATION_MODE "renderer.presentationmode"
+         #define PREF_CGSHANDLER_GS_RAM_READS_ENABLED "renderer.ramreads.enabled"
+         #define PREF_CGSHANDLER_WIDESCREEN "renderer.widescreen"
+        +#define PREF_CGSHANDLER_FRAMESKIP "renderer.frameskip"
+         
+         enum GS_REGS
+         {
+        @@ -1038,6 +1039,9 @@
+         	void ResetBase();
+         	virtual void ResetImpl();
+         	virtual void NotifyPreferencesChangedImpl();
+        +
+        +	void LoadFrameSkipPreference();
+        +	void UpdateFrameSkipState();
+         	virtual void FlipImpl(const DISPLAY_INFO&);
+         	virtual void MarkNewFrame();
+         	virtual void WriteRegisterImpl(uint8, uint64);
+        @@ -1133,6 +1137,12 @@
+         	FrameDumpCallback m_frameDumpCallback;
+         	bool m_regsDirty = false;
+         	bool m_drawEnabled = true;
+        +
+        +	//Frame skip: when set to N, only one frame out of every (N + 1) has its draws processed.
+        +	//Only accessed from the GS thread (or the caller when the GS isn't threaded).
+        +	uint32 m_frameSkip = 0;
+        +	uint32 m_frameSkipCounter = 0;
+        +	bool m_frameSkipping = false;
+         	CINTC* m_intc = nullptr;
+         	bool m_gsThreaded = true;
+         	bool m_flipped = false;
+        --- a/Source/gs/GSHandler.cpp
+        +++ b/Source/gs/GSHandler.cpp
+        @@ -63,6 +63,7 @@
+             : m_gsThreaded(gsThreaded)
+         {
+         	RegisterPreferences();
+        +	LoadFrameSkipPreference();
+         
+         	m_presentationParams.mode = static_cast<PRESENTATION_MODE>(CAppConfig::GetInstance().GetPreferenceInteger(PREF_CGSHANDLER_PRESENTATION_MODE));
+         	m_presentationParams.windowWidth = 512;
+        @@ -129,6 +130,7 @@
+         	CAppConfig::GetInstance().RegisterPreferenceInteger(PREF_CGSHANDLER_PRESENTATION_MODE, CGSHandler::PRESENTATION_MODE_FIT);
+         	CAppConfig::GetInstance().RegisterPreferenceBoolean(PREF_CGSHANDLER_GS_RAM_READS_ENABLED, true);
+         	CAppConfig::GetInstance().RegisterPreferenceBoolean(PREF_CGSHANDLER_WIDESCREEN, false);
+        +	CAppConfig::GetInstance().RegisterPreferenceInteger(PREF_CGSHANDLER_FRAMESKIP, 0);
+         }
+         
+         void CGSHandler::NotifyPreferencesChanged()
+        @@ -187,6 +189,32 @@
+         
+         void CGSHandler::NotifyPreferencesChangedImpl()
+         {
+        +	LoadFrameSkipPreference();
+        +}
+        +
+        +void CGSHandler::LoadFrameSkipPreference()
+        +{
+        +	constexpr int maxFrameSkip = 4;
+        +	int frameSkip = CAppConfig::GetInstance().GetPreferenceInteger(PREF_CGSHANDLER_FRAMESKIP);
+        +	if(frameSkip < 0) frameSkip = 0;
+        +	if(frameSkip > maxFrameSkip) frameSkip = maxFrameSkip;
+        +	m_frameSkip = static_cast<uint32>(frameSkip);
+        +	m_frameSkipCounter = 0;
+        +	m_frameSkipping = false;
+        +}
+        +
+        +void CGSHandler::UpdateFrameSkipState()
+        +{
+        +	//Called once per frame, this decides if draws of the next frame will be processed.
+        +	//With frame skip N, we render the frame when the counter wraps to 0 and skip the other N.
+        +	if(m_frameSkip == 0)
+        +	{
+        +		m_frameSkipCounter = 0;
+        +		m_frameSkipping = false;
+        +		return;
+        +	}
+        +	m_frameSkipCounter = (m_frameSkipCounter + 1) % (m_frameSkip + 1);
+        +	m_frameSkipping = (m_frameSkipCounter != 0);
+         }
+         
+         void CGSHandler::SetPresentationParams(const PRESENTATION_PARAMS& presentationParams)
+        @@ -586,6 +614,7 @@
+         {
+         	OnNewFrame(m_drawCallCount);
+         	m_drawCallCount = 0;
+        +	UpdateFrameSkipState();
+         	UpdateFrameDumpState();
+         #if LOGGING_ENABLED
+         	CLog::GetInstance().Print(LOG_NAME, "Frame Done.\r\n---------------------------------------------------------------------------------\r\n");
+        --- a/Source/gs/GSH_Vulkan/GSH_Vulkan.cpp
+        +++ b/Source/gs/GSH_Vulkan/GSH_Vulkan.cpp
+        @@ -648,7 +648,7 @@
+         	bool drawingKick = (registerId == GS_REG_XYZ2) || (registerId == GS_REG_XYZF2);
+         	bool fog = (registerId == GS_REG_XYZF2) || (registerId == GS_REG_XYZF3);
+         
+        -	if(!m_drawEnabled) drawingKick = false;
+        +	if(!m_drawEnabled || m_frameSkipping) drawingKick = false;
+         
+         	if(fog)
+         	{
+        --- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+        +++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+        @@ -1991,7 +1991,7 @@
+         	bool nDrawingKick = (nRegister == GS_REG_XYZ2) || (nRegister == GS_REG_XYZF2);
+         	bool nFog = (nRegister == GS_REG_XYZF2) || (nRegister == GS_REG_XYZF3);
+         
+        -	if(!m_drawEnabled) nDrawingKick = false;
+        +	if(!m_drawEnabled || m_frameSkipping) nDrawingKick = false;
+         
+         	if(nFog)
+         	{
+        --- a/build_android/src/main/res/xml/preferences_emu.xml
+        +++ b/build_android/src/main/res/xml/preferences_emu.xml
+        @@ -77,6 +77,17 @@
+                     android:title="@string/pref_emu_video_presentation_mode_title"
+                     app:iconSpaceReserved="false"
+                     app:useSimpleSummaryProvider="true" />
+        +
+        +        <ListPreference
+        +            android:defaultValue="0"
+        +            android:entries="@array/pref_emu_video_frame_skip_entries"
+        +            android:entryValues="@array/pref_emu_video_frame_skip_values"
+        +            android:key="renderer.frameskip"
+        +            android:negativeButtonText="@null"
+        +            android:positiveButtonText="@null"
+        +            android:title="@string/pref_emu_video_frame_skip_title"
+        +            app:iconSpaceReserved="false"
+        +            app:useSimpleSummaryProvider="true" />
+             </PreferenceCategory>
+         
+             <PreferenceCategory
+        --- a/build_android/src/main/res/values/strings.xml
+        +++ b/build_android/src/main/res/values/strings.xml
+        @@ -66,6 +66,8 @@
+         
+         	<string name="pref_emu_video_res_factor_title">Set Resolution Factor</string>
+         
+        +	<string name="pref_emu_video_frame_skip_title">Frame Skip</string>
+        +
+         	<string name="pref_emu_video_widescreen_title">Resize Output to Widescreen</string>
+         	<string name="pref_emu_video_widescreen_summary">Resizes video to 16:9 ratio</string>
+         
+        @@ -126,6 +128,14 @@
+         		<item>8x</item>
+         	</string-array>
+         
+        +	<string-array name="pref_emu_video_frame_skip_entries">
+        +		<item>Off</item>
+        +		<item>Skip 1 of every 2 frames</item>
+        +		<item>Skip 2 of every 3 frames</item>
+        +		<item>Skip 3 of every 4 frames</item>
+        +		<item>Skip 4 of every 5 frames</item>
+        +	</string-array>
+        +
+         	<string-array name="pref_emu_video_presentation_mode_entries">
+         		<item>Fill Screen</item>
+         		<item>Fit Screen(Default)</item>
+        --- a/build_android/src/main/res/values/donottranslate.xml
+        +++ b/build_android/src/main/res/values/donottranslate.xml
+        @@ -41,6 +41,14 @@
+         		<item>8</item>
+             </string-array>
+         
+        +	<string-array name="pref_emu_video_frame_skip_values">
+        +		<item>0</item>
+        +		<item>1</item>
+        +		<item>2</item>
+        +		<item>3</item>
+        +		<item>4</item>
+        +	</string-array>
+        +
+         	<string-array name="pref_emu_video_presentation_mode_values">
+         		<item>0</item>
+         		<item>1</item>
+        PATCH_EOF
+        if git apply --reverse --check frameskip.patch 2>/dev/null; then
+          echo "Patch already applied, skipping"
+        else
+          git apply --verbose frameskip.patch
+        fi
+    - name: Build APK
+      run: |
+        cd build_android
+        ./gradlew assembleRelease
+    - name: Sign APK
+      run: |
+        export ANDROID_BUILD_TOOLS=$ANDROID_HOME/build-tools/${{ env.ANDROID_BUILD_TOOLS_VERSION }}
+        keytool -genkeypair -keystore my.keystore -alias key -keyalg RSA -keysize 2048 -validity 10000 -storepass playbuild -keypass playbuild -dname "CN=Play Build"
+        cp build_android/build/outputs/apk/release/Play-release-unsigned.apk Play-unaligned.apk
+        $ANDROID_BUILD_TOOLS/zipalign -f -p 4 Play-unaligned.apk Play-aligned.apk
+        $ANDROID_BUILD_TOOLS/apksigner sign --ks my.keystore --ks-key-alias key --ks-pass pass:playbuild --key-pass pass:playbuild --out Play-FrameSkip.apk Play-aligned.apk
+        $ANDROID_BUILD_TOOLS/apksigner verify Play-FrameSkip.apk
+    - name: Upload APK
+      uses: actions/upload-artifact@v7
+      with:
+        name: Play-FrameSkip-APK
+        path: Play-FrameSkip.apk
